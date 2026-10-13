@@ -1,0 +1,105 @@
+# Gateway + web only.
+#
+# `opencode serve` is NOT in this compose file on purpose. It is a Windows
+# process started by host/host-supervisor.mjs on the host, because that is where
+# the user's projects and the opencode install live. The container reaches it
+# over host.docker.internal.
+
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: opencode-mobile:local
+    container_name: opencode-gateway
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    environment:
+      # The container has no pnpm-workspace.yaml, so the API is told where the
+      # workspace root is in order to find apps/web/dist.
+      WORKSPACE_ROOT: /app
+      # The supervisor runs on the host. host.docker.internal is how a Linux
+      # container reaches a service bound on the Windows host.
+      SUPERVISOR_URL: http://host.docker.internal:4100
+      # Overridden here on purpose, and it must stay in step with
+      # GATEWAY_BIND_HOST below: both are loopback values on the host and have to
+      # be reversed for the container.
+      #
+      # .env is the native-run config, where serve is on this machine and
+      # SERVE_HOST=127.0.0.1 is correct. env_file would hand that same value to
+      # the container, where 127.0.0.1 is the container itself and every proxy
+      # request would fail with a connection refused that looks like a broken
+      # supervisor. Inside the container, serve is on the host.
+      SERVE_HOST: host.docker.internal
+      # 0.0.0.0 inside the container, deliberately.
+      #
+      # This looks like it contradicts the loopback default, and it was a real
+      # bug when it said 127.0.0.1 here: Docker's published port is forwarded from
+      # outside the container's network namespace, so a service bound to the
+      # container's own 127.0.0.1 is unreachable through it and every request
+      # dies with a connection reset. The published port below is what keeps this
+      # off the LAN; binding inside the container is not a LAN exposure.
+      GATEWAY_BIND_HOST: 0.0.0.0
+      DATA_DIR: /app/data
+      LOG_DIR: /app/logs
+
+    volumes:
+      # Named volume, not a bind mount, and this is load-bearing.
+      #
+      # auth.db must outlive the container, or every rebuild drops the account.
+      # It used to be a bind mount from ./data, which kept the host CLIs working
+      # but made the database stale in a way that is a security problem: Docker
+      # Desktop's Windows bind mount does not present a host-side write to a
+      # process that already holds the file open, so a gateway running since
+      # before `pnpm auth:setup` kept serving the pre-write state indefinitely.
+      # Measured directly: a container handle held at 2 rows while the host
+      # committed 4, and auth.db's mtime never changed at all, so no stat-based
+      # reopen could ever have detected it. See PLAN.md.
+      #
+      # A named volume is a real Linux filesystem inside the Docker VM, where
+      # SQLite's locking and change detection behave normally. The cost is that
+      # the host can no longer see this file, so the auth and project CLIs must
+      # run in the container (scripts/auth.ps1 wraps that) and a backup is a
+      # `docker cp` rather than a file copy.
+      - ocm-data:/app/data
+      # Logs stay a bind mount on purpose. They are written by the container and
+      # read fresh by the host, which the staleness bug does not affect, and
+      # having them in ./logs is worth much more than the tidiness of one rule.
+      - ./logs:/app/logs
+
+    ports:
+      # Published to the host's loopback, not to the LAN. This is the single most
+      # important line in this file: "3000:3000" would publish the login
+      # endpoint, and through the proxy a full coding agent, to the whole network.
+      - "127.0.0.1:3000:3000"
+
+    # Binding the supervisor and the serve ports to 0.0.0.0 is required for the
+    # container to reach them, and scripts/firewall-check.ps1 is what keeps that
+    # from becoming a LAN exposure.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    security_opt:
+      - no-new-privileges:true
+
+    cap_drop:
+      - ALL
+
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/api/auth/state').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+volumes:
+  # The live database and project allowlist. See the note on the volume mount
+  # above for why this is not ./data.
+  ocm-data:

@@ -1,0 +1,31 @@
+{
+  "name": "opencode-mobile",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "packageManager": "pnpm@10.30.3",
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  },
+  "scripts": {
+    "dev": "pnpm --parallel --filter \"@ocm/api\" --filter \"@ocm/web\" dev",
+    "dev:api": "pnpm --filter @ocm/api dev",
+    "dev:web": "pnpm --filter @ocm/web dev",
+    "build": "pnpm --filter @ocm/web build && pnpm --filter @ocm/api build",
+    "test": "pnpm -r test",
+    "typecheck": "pnpm -r typecheck",
+    "auth:setup": "pnpm --filter @ocm/api auth:setup",
+    "auth:reset-password": "pnpm --filter @ocm/api auth:reset-password",
+    "auth:disable-totp": "pnpm --filter @ocm/api auth:disable-totp",
+    "auth:sessions": "pnpm --filter @ocm/api auth:sessions",
+    "project:add": "pnpm --filter @ocm/api project:add",
+    "supervisor": "node host/host-supervisor.mjs",
+    "auth:enable-totp": "pnpm --filter @ocm/api auth:enable-totp",
+    "auth:check-totp": "pnpm --filter @ocm/api auth:check-totp"
+  }
+}

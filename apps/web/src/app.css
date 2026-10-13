@@ -1,0 +1,226 @@
+/*
+ * Mobile-first base styles.
+ *
+ * Two things here are not cosmetic:
+ *
+ *  - `env(safe-area-inset-*)` padding. Without it, the sticky header hides under
+ *    an iOS notch and the tab bar hides under the home indicator.
+ *  - `overscroll-behavior: contain` on scrollers. Otherwise dragging a list down
+ *    triggers the browser's pull-to-refresh / back-navigation gesture, which on a
+ *    chat transcript is very annoying.
+ */
+
+:root {
+  --bg: #0b0d12;
+  --bg-raised: #141821;
+  --bg-sunken: #070809;
+  --border: #232936;
+  --text: #e6e9ef;
+  --text-dim: #9aa3b2;
+  --text-faint: #6b7383;
+  --accent: #4c8dff;
+  --accent-dim: #2f5da8;
+  --danger: #ff6b6b;
+  --warn: #ffb454;
+  --ok: #43c59e;
+
+  --tabbar-h: 56px;
+  --header-h: 52px;
+  --radius: 12px;
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+
+  color-scheme: dark;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f7f8fa;
+    --bg-raised: #ffffff;
+    --bg-sunken: #eceef2;
+    --border: #d8dce4;
+    --text: #10131a;
+    --text-dim: #5a6373;
+    --text-faint: #8a92a0;
+    --accent: #2563eb;
+    --accent-dim: #1d4ed8;
+    color-scheme: light;
+  }
+}
+
+* {
+  box-sizing: border-box;
+  -webkit-tap-highlight-color: transparent;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 16px;
+  line-height: 1.45;
+  /* Prevents iOS from zooming when a field is focused: inputs below 16px
+     trigger an automatic viewport zoom that never scrolls back. */
+  -webkit-text-size-adjust: 100%;
+}
+
+#app {
+  height: 100%;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 14px;
+  min-height: 44px; /* comfortable touch target */
+  cursor: pointer;
+}
+button:active:not(:disabled) {
+  transform: scale(0.98);
+}
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+button.danger {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 40%, transparent);
+}
+button.ghost {
+  background: transparent;
+  border-color: transparent;
+  color: var(--text-dim);
+}
+
+input,
+textarea,
+select {
+  font: inherit;
+  color: var(--text);
+  background: var(--bg-sunken);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px;
+  width: 100%;
+  /* 16px minimum: anything smaller makes iOS zoom on focus. */
+  font-size: 16px;
+}
+input:focus,
+textarea:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+  border-color: var(--accent);
+}
+input[autocomplete="one-time-code"] {
+  font-family: var(--mono);
+  letter-spacing: 0.3em;
+  text-align: center;
+}
+
+a {
+  color: var(--accent);
+}
+
+/* Utility bits used across screens. */
+.muted {
+  color: var(--text-dim);
+}
+.faint {
+  color: var(--text-faint);
+  font-size: 0.85rem;
+}
+.mono {
+  font-family: var(--mono);
+  font-size: 0.85rem;
+}
+.row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.col {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.spread {
+  justify-content: space-between;
+}
+.grow {
+  flex: 1;
+  min-width: 0;
+}
+.truncate {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.card {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px;
+}
+
+.error {
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent);
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-size: 0.9rem;
+}
+.notice {
+  color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--warn) 35%, transparent);
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-size: 0.9rem;
+}
+
+.spinner {
+  width: 18px;
+  height: 18px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .spinner {
+    animation-duration: 2s;
+  }
+  * {
+    transition-duration: 0.01ms !important;
+  }
+}
+
+pre {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  overflow: auto;
+  overscroll-behavior: contain;
+  white-space: pre-wrap;
+  word-break: break-word;
+}

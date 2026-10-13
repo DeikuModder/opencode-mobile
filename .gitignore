@@ -1,0 +1,27 @@
+# secrets — never commit
+.env
+.env.local
+*.pem
+
+# runtime state
+data/
+logs/
+
+# tunnel credentials (live TunnelSecret lives here)
+.cloudflared/
+
+# deps / builds
+node_modules/
+dist/
+.svelte-kit/
+build/
+*.tsbuildinfo
+
+# generated reference artifact (5MB); regenerate with GET /doc
+openapi-1.18.32.json
+
+# editor / os
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

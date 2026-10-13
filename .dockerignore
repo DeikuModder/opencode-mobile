@@ -1,0 +1,22 @@
+node_modules
+**/node_modules
+dist
+**/dist
+.svelte-kit
+**/.svelte-kit
+build
+**/build
+
+# never bake secrets or runtime state into the image
+.env
+.env.local
+data
+logs
+*.pem
+.cloudflared
+
+.git
+.gitignore
+openapi-1.18.32.json
+*.md
+!README.md

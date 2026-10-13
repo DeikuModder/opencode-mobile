@@ -1,0 +1,18 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "./dist",
+    // Pinned rather than inferred. With both src/ and scripts/ in `include`,
+    // TypeScript infers the common root as the package directory and emits
+    // dist/src/... and dist/scripts/... — so the entry point is dist/src/main.js,
+    // not dist/main.js. Setting rootDir explicitly makes that layout a decision
+    // instead of an accident, and it fails loudly if a stray file is added above
+    // the package.
+    "rootDir": "./",
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true,
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts", "scripts/**/*.ts"],
+  "exclude": ["dist", "node_modules"]
+}
