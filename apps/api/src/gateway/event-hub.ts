@@ -67,15 +67,58 @@ const DEFAULT_SILENCE_TIMEOUT_MS = 45_000
 /** How often the liveness check runs. Coarse, because the timeout is coarse. */
 const DEFAULT_LIVENESS_CHECK_MS = 15_000
 
+/** Minimum interval between directory scans driven by subscriptions. */
+const DEFAULT_SCAN_INTERVAL_MS = 5 * 60_000
+
+/** Timeout for one upstream REST read while discovering the dial set. */
+const SCAN_REQUEST_TIMEOUT_MS = 10_000
+
 /**
- * A single upstream event stream per project, fanned out in process.
+ * One upstream event connection to `opencode serve`, scoped to a directory.
+ *
+ * opencode filters the `/event` bus by the `directory` query this gateway
+ * discovered the hard way: a bare dial answers 200 and then delivers only the
+ * frames whose session directory matches the serve's own cwd — verified live
+ * against 1.18.35, where a turn in an opencode-mobile session arrived on a
+ * `/event?directory=<opencode-mobile>` dial and never on the bare one, while a
+ * turn in a chain session arrived on the bare dial and `/event?directory=<chain>`
+ * but not on other scopes. There is no wildcard: `directory=*`, an empty value,
+ * the global project id and an invented path all delivered heartbeats only.
+ *
+ * In hub terms: the hub keeps one socket per directory that holds
+ * sessions, and fanned-out frames go to every subscriber of the project.
+ */
+interface UpstreamSocket {
+  /**
+   * The directory scope of this dial. Empty means the bare `/event` URL, whose
+   * scope is the serve's own working directory — the project path the supervisor
+   * always spawns serve with.
+   */
+  directory: string
+  req: ClientRequest | null
+  res: IncomingMessage | null
+  /** True from dialling until the attempt resolves, so ticks cannot double-dial. */
+  connecting: boolean
+  buffer: string
+  retryMs: number
+  failures: number
+  retryTimer: ReturnType<typeof setTimeout> | null
+  /** Fires while this socket is open, to catch a silent-but-open one. */
+  livenessTimer: ReturnType<typeof setInterval> | null
+  /** When bytes last arrived on this socket, 0 when there is no socket. */
+  lastFrameAt: number
+}
+
+/**
+ * One project's shared event surface: the subscribers that must receive every
+ * frame, and the one upstream connection per directory that produces them.
  *
  * Why this exists: every browser tab and the Telegram notifier used to open its
  * own connection to `opencode serve`. That is correct but scales badly in both
  * directions. N tabs meant N upstream connections, and when `serve` restarted,
  * all N failed at once and all N retried at once — a disconnect storm that the
- * upstream cannot distinguish from real load. One connection with N local
- * subscribers collapses that to a single upstream reconnect.
+ * upstream cannot distinguish from real load. One set of connections with N
+ * local subscribers collapses that to a single upstream reconnect.
  *
  * The safety argument for sharing is not obvious and is worth stating, because a
  * shared stream normally implies late subscribers miss a snapshot. Here it does
@@ -93,6 +136,40 @@ const DEFAULT_LIVENESS_CHECK_MS = 15_000
  * not reachable as a route: the only way to attach a subscriber is from behind
  * the session guard.
  */
+interface ProjectStream {
+  project: ProjectEntry
+  subscribers: Set<HubSubscriber>
+  waiters: Array<(ok: boolean) => void>
+  /** Keyed by directory scope. "" is the bare dial. */
+  sockets: Map<string, UpstreamSocket>
+  /** 0 until the first scan of this stream cycle; a retired stream resets it. */
+  lastScanAt: number
+  scanning: boolean
+  graceTimer: ReturnType<typeof setTimeout> | null
+  stopped: boolean
+  /**
+   * Set when every socket has exhausted its budget and subscribers were
+   * flushed; cleared the next time any socket opens, so one outage flushes
+   * once instead of once per retry per socket.
+   */
+  flushedSinceLastOpen: boolean
+}
+
+function makeSocket(directory: string): UpstreamSocket {
+  return {
+    directory,
+    req: null,
+    res: null,
+    connecting: false,
+    buffer: "",
+    retryMs: 1_000,
+    failures: 0,
+    retryTimer: null,
+    livenessTimer: null,
+    lastFrameAt: 0,
+  }
+}
+
 @Injectable()
 export class EventHub implements OnModuleDestroy {
   private readonly logger = new Logger(EventHub.name)
@@ -107,6 +184,7 @@ export class EventHub implements OnModuleDestroy {
   private readonly maxSilentFailures: number
   private readonly silenceTimeoutMs: number
   private readonly livenessCheckMs: number
+  private readonly scanIntervalMs: number
 
   constructor(
     @Inject(APP_CONFIG) private readonly config: AppConfig,
@@ -119,6 +197,7 @@ export class EventHub implements OnModuleDestroy {
     this.maxSilentFailures = num("EVENT_HUB_MAX_SILENT_FAILURES", DEFAULT_MAX_SILENT_FAILURES)
     this.silenceTimeoutMs = num("EVENT_HUB_SILENCE_TIMEOUT_MS", DEFAULT_SILENCE_TIMEOUT_MS)
     this.livenessCheckMs = num("EVENT_HUB_LIVENESS_CHECK_MS", DEFAULT_LIVENESS_CHECK_MS)
+    this.scanIntervalMs = num("EVENT_HUB_SCAN_INTERVAL_MS", DEFAULT_SCAN_INTERVAL_MS)
   }
 
   /**
@@ -131,21 +210,33 @@ export class EventHub implements OnModuleDestroy {
     if (stream.stopped) return () => undefined
     stream.subscribers.add(subscriber)
 
-    // A tab opening is a good moment to retry: someone is actually waiting, and
-    // the alternative is up to retryMaxMs of a connection that looks open and
-    // carries nothing. Bounded because each new subscriber causes at most one
-    // dial, and the retry counter still climbs if it keeps failing.
-    if (stream.res === null && stream.retryTimer !== null) {
-      this.clearRetry(stream)
-      stream.retryMs = this.retryMinMs
-      this.connect(stream)
-    } else if (stream.res === null && stream.retryTimer === null && stream.graceTimer === null) {
-      this.connect(stream)
-    }
-
     if (stream.graceTimer) {
       clearTimeout(stream.graceTimer)
       stream.graceTimer = null
+    }
+
+    // Discover which directories hold sessions, one socket each, at most once
+    // per interval or per stream cycle. The bare socket always exists, so
+    // something is dialled even while the scan runs.
+    if (!stream.scanning && stream.lastScanAt === 0) {
+      void this.refreshDialSet(stream)
+    } else if (!stream.scanning && Date.now() - stream.lastScanAt > this.scanIntervalMs) {
+      void this.refreshDialSet(stream)
+    }
+
+    // A tab opening is a good moment to retry: someone is actually waiting, and
+    // the alternative is up to retryMaxMs of a connection that looks open and
+    // carries nothing. Bounded because each new subscriber causes at most one
+    // dial per socket, and the retry counter still climbs if it keeps failing.
+    for (const socket of stream.sockets.values()) {
+      if (socket.res !== null) continue
+      if (socket.retryTimer !== null) {
+        this.clearRetry(socket)
+        socket.retryMs = this.retryMinMs
+        this.connect(stream, socket)
+      } else if (!socket.connecting) {
+        this.connect(stream, socket)
+      }
     }
 
     let attached = true
@@ -162,30 +253,47 @@ export class EventHub implements OnModuleDestroy {
    * This exists to preserve the 503 a browser used to get when `serve` was down.
    * The hub reconnects on its own, so a proxy that answered 200 unconditionally
    * would hand the client a live-looking empty stream and hide the outage.
+   *
+   * With several directory sockets the answer is optimistic: any open socket
+   * means serve is up and frames can arrive. Sockets that dial a directory with
+   * no traffic sit healthy and silent, so waiting for all of them would read a
+   * perfectly good stream as a hung one.
    */
-  waitForOpen(project: ProjectEntry, timeoutMs = 5_000): Promise<boolean> {
-    const stream = this.streamFor(project)
-    if (stream.stopped) return Promise.resolve(false)
-    if (stream.res !== null) return Promise.resolve(true)
+  async waitForOpen(project: ProjectEntry, timeoutMs = 5_000): Promise<boolean> {
+    const stream = this.streams.get(project.id)
+    if (!stream || stream.stopped) return false
 
-    return new Promise<boolean>((resolve) => {
-      let done = false
-      const finish = (ok: boolean): void => {
-        if (done) return
-        done = true
-        stream.waiters = stream.waiters.filter((w) => w !== finish)
-        resolve(ok)
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      if (stream.stopped) return false
+      let open = false
+      let allFailed = stream.sockets.size > 0
+      let pending = false
+      for (const socket of stream.sockets.values()) {
+        if (socket.res !== null) {
+          open = true
+          break
+        }
+        if (socket.failures === 0) allFailed = false
+        if (socket.retryTimer !== null || socket.connecting) pending = true
       }
-      stream.waiters.push(finish)
-      const timer = setTimeout(() => finish(false), timeoutMs)
-      timer.unref?.()
-    })
+      if (open) return true
+      // Everything has failed at least once and nothing is in flight: a genuine
+      // cold-start failure, answerable with a 503. A retry timer still pending
+      // means the next attempt may yet succeed, so only report failure when
+      // there is nothing left to wait for.
+      if (allFailed && !pending) return false
+      await new Promise((r) => setTimeout(r, 20))
+    }
+    return false
   }
 
   state(projectId: string): HubState {
     const stream = this.streams.get(projectId)
     if (!stream || stream.stopped) return "closed"
-    if (stream.res !== null) return "open"
+    for (const socket of stream.sockets.values()) {
+      if (socket.res !== null) return "open"
+    }
     return "connecting"
   }
 
@@ -197,14 +305,14 @@ export class EventHub implements OnModuleDestroy {
   onModuleDestroy(): void {
     for (const stream of this.streams.values()) {
       stream.stopped = true
-      this.clearRetry(stream)
-      this.stopLivenessCheck(stream)
       if (stream.graceTimer) clearTimeout(stream.graceTimer)
       stream.graceTimer = null
-      stream.res?.destroy()
-      stream.res = null
-      stream.req?.destroy()
-      stream.req = null
+      for (const socket of stream.sockets.values()) {
+        this.clearRetry(socket)
+        this.stopLivenessCheck(socket)
+        socket.res?.destroy()
+        socket.req?.destroy()
+      }
     }
     this.streams.clear()
   }
@@ -224,17 +332,12 @@ export class EventHub implements OnModuleDestroy {
       project,
       subscribers: new Set(),
       waiters: [],
-      req: null,
-      res: null,
-      connecting: false,
-      buffer: "",
-      retryMs: this.retryMinMs,
-      failures: 0,
-      retryTimer: null,
+      sockets: new Map(),
+      lastScanAt: 0,
+      scanning: false,
       graceTimer: null,
-      livenessTimer: null,
-      lastFrameAt: 0,
       stopped: false,
+      flushedSinceLastOpen: false,
     }
     this.streams.set(project.id, created)
     return created
@@ -251,77 +354,203 @@ export class EventHub implements OnModuleDestroy {
     stream.graceTimer = setTimeout(() => {
       stream.graceTimer = null
       if (stream.subscribers.size > 0 || stream.stopped) return
-      this.closeUpstream(stream)
+      for (const socket of stream.sockets.values()) {
+        this.clearRetry(socket)
+        this.stopLivenessCheck(socket)
+        socket.res?.destroy()
+        socket.req?.destroy()
+      }
+      stream.sockets.clear()
+      // A forced rescan at next attach picks up directories that appeared while
+      // nobody was listening.
+      stream.lastScanAt = 0
     }, this.idleGraceMs)
     stream.graceTimer.unref?.()
   }
 
-  private connect(stream: ProjectStream): void {
-    // The `connecting` guard matters: ensureStarted is awaited, so `res` is still
-    // null for the whole of it. Without this, several tabs attaching in the same
-    // tick would each dial upstream — the exact fan-out this class exists to
-    // prevent, reintroduced through the back door.
-    if (stream.stopped || stream.res !== null || stream.connecting) return
-    stream.connecting = true
+  /**
+   * The set of directories this project's sessions live in, plus the bare dial.
+   *
+   * Reads the same shape the REST aggregated list uses: the bare session list
+   * carries the global-project sessions (whose directories are exactly the
+   * non-worktree ones), and each worktree in `/project` contributes its scoped
+   * list. The serve's own directory is not dialled separately — the bare dial
+   * already covers it, verified live, and a second socket for the same scope
+   * would deliver every frame twice.
+   */
+  private listSessionDirectories(project: ProjectEntry): Promise<Set<string>> {
+    const dirs = new Set<string>()
+    const base = `http://${this.config.serve.host}:${project.port}`
+    const headers: Record<string, string> = {}
+    if (this.config.serve.password) {
+      headers["authorization"] = `Basic ${Buffer.from(`opencode:${this.config.serve.password}`).toString("base64")}`
+    }
+    const getJson = async (path: string): Promise<unknown> => {
+      const res = await fetch(`${base}${path}`, { headers, signal: AbortSignal.timeout(SCAN_REQUEST_TIMEOUT_MS) })
+      if (!res.ok) throw new Error(`upstream ${path} answered ${res.status}`)
+      return res.json()
+    }
+    const absorb = (payload: unknown): void => {
+      for (const s of Array.isArray(payload) ? (payload as Array<Record<string, unknown>>) : []) {
+        const d = s?.directory
+        if (typeof d === "string" && d) dirs.add(d)
+      }
+    }
+    const safe = async (path: string, label: string): Promise<void> => {
+      try {
+        absorb(await getJson(path))
+      } catch (err) {
+        // One unreadable scope degrades to less coverage; it must not take the
+        // whole dial set down. The bare dial still streams the project path.
+        this.logger.debug(`directory scan skipped ${label}: ${(err as Error).message}`)
+      }
+    }
 
-    // Ensures `serve` is up before dialling, but a refusal is advisory rather
-    // than final: the supervisor is a control plane that can be restarting or
-    // briefly unreachable while `serve` itself is perfectly alive. Treating its
-    // answer as authoritative would silence a working stream until the
-    // supervisor recovered. The dial is the ground truth for whether events are
-    // available, and a failed dial is already handled by the retry below.
-    //
-    // A rejection here means the supervisor is unreachable or refused to spawn;
-    // without a catch it would become an unhandled rejection that can take the
-    // gateway down.
-    void this.registry
-      .ensureStarted(stream.project.id)
-      .then((result) => {
-        if (stream.stopped) return
-        if (!result.ok) {
-          this.logger.warn(`serve did not start for "${stream.project.id}": ${result.detail ?? "unknown"}`)
-        } else {
-          this.registry.touch(stream.project.id)
-        }
-        this.openStream(stream)
-      })
-      .catch((err: Error) => {
-        this.logger.warn(`ensureStarted threw for "${stream.project.id}": ${err.message}`)
-        this.openStream(stream)
-      })
+    return (async () => {
+      await safe("/session", "the bare session list")
+      let worktrees: string[] = []
+      try {
+        const payload = await getJson("/project")
+        worktrees = (Array.isArray(payload) ? payload : [])
+          .map((p) => (p as { worktree?: unknown })?.worktree)
+          .filter((w): w is string => typeof w === "string" && w !== "/" && w.length > 0)
+      } catch (err) {
+        this.logger.debug(`worktree scan failed, dial scope stays bare: ${(err as Error).message}`)
+      }
+      if (worktrees.length > 0) {
+        // The same path can be registered under several ids; one scoped read
+        // per unique path is enough.
+        for (const w of [...new Set(worktrees)]) await safe(`/session?directory=${encodeURIComponent(w)}`, w)
+      }
+      // The bare dial streams the serve's own directory; never duplicate it.
+      dirs.delete(project.path)
+      return dirs
+    })()
   }
 
-  private openStream(stream: ProjectStream): void {
+  /**
+   * Rebuild the socket set from a fresh scan. The bare socket always exists,
+   * even while the scan fails or runs, so frames keep flowing for the project
+   * path while discovery adds or drops the rest.
+   */
+  private async refreshDialSet(stream: ProjectStream): Promise<void> {
+    if (stream.scanning || stream.stopped) return
+    stream.scanning = true
+    try {
+      // The bare socket exists regardless of what the scan finds: it is the
+      // dial for the serve's own directory, and the only one guaranteed to
+      // cover the sessions of this project path.
+      if (!stream.sockets.has("")) {
+        const bare = makeSocket("")
+        stream.sockets.set("", bare)
+        this.connect(stream, bare)
+      }
+      await this.ensureStartedThrottled(stream)
+      const dirs = await this.listSessionDirectories(stream.project)
+      if (stream.stopped) return
+      for (const [dir, socket] of [...stream.sockets]) {
+        if (dir !== "" && !dirs.has(dir)) {
+          // A directory emptied out: stop paying for its dial.
+          this.clearRetry(socket)
+          this.stopLivenessCheck(socket)
+          socket.res?.destroy()
+          socket.req?.destroy()
+          stream.sockets.delete(dir)
+        }
+      }
+      for (const dir of dirs) {
+        if (stream.sockets.has(dir)) continue
+        const socket = makeSocket(dir)
+        stream.sockets.set(dir, socket)
+        this.connect(stream, socket)
+      }
+      stream.lastScanAt = Date.now()
+    } finally {
+      stream.scanning = false
+    }
+  }
+
+  /**
+   * ensureStarted advisory, throttled per stream: with one socket per directory
+   * a retry storm must not translate into one supervisor call per socket.
+   */
+  private ensureStartedMemo = new Map<string, number>()
+  private async ensureStartedThrottled(stream: ProjectStream): Promise<void> {
+    const last = this.ensureStartedMemo.get(stream.project.id) ?? 0
+    if (Date.now() - last < 15_000) return
+    this.ensureStartedMemo.set(stream.project.id, Date.now())
+    try {
+      const result = await this.registry.ensureStarted(stream.project.id)
+      if (stream.stopped) return
+      if (!result.ok) {
+        this.logger.warn(`serve did not start for "${stream.project.id}": ${result.detail ?? "unknown"}`)
+      } else {
+        this.registry.touch(stream.project.id)
+      }
+    } catch (err) {
+      this.logger.warn(`ensureStarted threw for "${stream.project.id}": ${(err as Error).message}`)
+    }
+  }
+
+  private connect(stream: ProjectStream, socket: UpstreamSocket): void {
+    // The `connecting` guard matters: openStream is two hops away from
+    // synchronous (`ensureStartedThrottled` runs first for the bare socket),
+    // so `res` is null for that whole window. Without this, several tabs
+    // attaching at once would each dial upstream — the exact fan-out this
+    // class exists to prevent.
+    if (stream.stopped || socket.res !== null || socket.connecting) return
+    socket.connecting = true
+
+    // The bare dial carries the supervisor round-trip because it is the first
+    // socket to exist on a fresh cycle; the rest dial straight away. A refusal
+    // is advisory rather than final: the supervisor is a control plane that can
+    // be restarting while `serve` itself is perfectly alive, and the dial is the
+    // ground truth for whether events are available.
+    if (socket.directory === "") {
+      void this.ensureStartedThrottled(stream).then(() => {
+        if (stream.stopped) return
+        this.openStream(stream, socket)
+      })
+    } else {
+      this.openStream(stream, socket)
+    }
+  }
+
+  private openStream(stream: ProjectStream, socket: UpstreamSocket): void {
     if (stream.stopped) return
-    stream.connecting = false
+    socket.connecting = false
 
     const headers: Record<string, string> = { accept: "text/event-stream" }
     if (this.config.serve.password) {
       headers["authorization"] = `Basic ${Buffer.from(`opencode:${this.config.serve.password}`).toString("base64")}`
     }
 
-    const target = `http://${this.config.serve.host}:${stream.project.port}/event`
+    const scope = socket.directory ? `?directory=${encodeURIComponent(socket.directory)}` : ""
+    const target = `http://${this.config.serve.host}:${stream.project.port}/event${scope}`
     const req = httpRequest(target, { headers }, (res) => {
       if ((res.statusCode ?? 0) !== 200) {
         res.resume()
-        this.scheduleRetry(stream, `status ${res.statusCode}`)
+        this.scheduleRetry(stream, socket, `status ${res.statusCode}`)
         return
       }
       if (stream.stopped) {
         res.destroy()
         return
       }
-      stream.req = req
-      stream.res = res
-      stream.buffer = ""
-      stream.retryMs = this.retryMinMs
-      stream.failures = 0
+      socket.req = req
+      socket.res = res
+      socket.buffer = ""
+      socket.retryMs = this.retryMinMs
+      socket.failures = 0
+      stream.flushedSinceLastOpen = false
       // Armed as soon as the socket is live, not on the first frame: a socket that
       // connects and then says nothing is exactly the failure this watches for.
-      stream.lastFrameAt = Date.now()
-      this.startLivenessCheck(stream)
-      this.logger.log(`event stream open for project "${stream.project.id}" (${stream.subscribers.size} subscriber(s))`)
-
+      socket.lastFrameAt = Date.now()
+      this.startLivenessCheck(stream, socket)
+      const scopeLabel = socket.directory === "" ? "bare" : socket.directory
+      this.logger.log(`event stream open for project "${stream.project.id}" (${scopeLabel}, ${stream.subscribers.size} subscriber(s))`)
+      // First open wins: a waiter only ever exists on a cold start, and one
+      // reachable socket is enough to answer the browser with a real stream.
       const opened = stream.waiters
       stream.waiters = []
       for (const waiter of opened) waiter(true)
@@ -330,22 +559,22 @@ export class EventHub implements OnModuleDestroy {
       res.on("data", (chunk: string) => {
         // Any bytes at all count as liveness, including a comment keepalive. The
         // question is whether the peer is still there, not whether it had news.
-        stream.lastFrameAt = Date.now()
-        this.ingest(stream, chunk)
+        socket.lastFrameAt = Date.now()
+        this.ingest(stream, socket, chunk)
       })
-      res.on("end", () => this.scheduleRetry(stream, "stream ended"))
+      res.on("end", () => this.scheduleRetry(stream, socket, "stream ended"))
       res.on("error", (err) => {
         this.logger.warn(`event stream for "${stream.project.id}" errored: ${err.message}`)
-        this.scheduleRetry(stream, "stream error")
+        this.scheduleRetry(stream, socket, "stream error")
       })
     })
 
     req.on("error", (err) => {
       this.logger.warn(`event stream connect failed for "${stream.project.id}": ${err.message}`)
-      this.scheduleRetry(stream, "connect error")
+      this.scheduleRetry(stream, socket, "connect error")
     })
     req.end()
-    stream.req = req
+    socket.req = req
   }
 
   /**
@@ -364,46 +593,46 @@ export class EventHub implements OnModuleDestroy {
    * is orphaned. This is deliberately the aggressive option, because the failure it
    * prevents is silent and total while the cost of being wrong is one extra dial.
    */
-  private startLivenessCheck(stream: ProjectStream): void {
-    this.stopLivenessCheck(stream)
+  private startLivenessCheck(stream: ProjectStream, socket: UpstreamSocket): void {
+    this.stopLivenessCheck(socket)
     const timer = setInterval(() => {
-      if (stream.stopped || stream.res === null) return
-      if (Date.now() - stream.lastFrameAt < this.silenceTimeoutMs) return
+      if (stream.stopped || socket.res === null) return
+      if (Date.now() - socket.lastFrameAt < this.silenceTimeoutMs) return
       this.logger.warn(
-        `event stream for "${stream.project.id}" has been silent for over ` +
+        `event stream for "${stream.project.id}" (${socket.directory || "bare"}) has been silent for over ` +
           `${this.silenceTimeoutMs}ms with the socket still open; redialling`,
       )
       // Counted as a failure so a serve that is genuinely gone still escalates to
       // flushing subscribers rather than being retried quietly forever.
-      this.scheduleRetry(stream, "silent upstream")
+      this.scheduleRetry(stream, socket, "silent upstream")
     }, this.livenessCheckMs)
     timer.unref?.()
-    stream.livenessTimer = timer
+    socket.livenessTimer = timer
   }
 
-  private stopLivenessCheck(stream: ProjectStream): void {
-    if (stream.livenessTimer) {
-      clearInterval(stream.livenessTimer)
-      stream.livenessTimer = null
+  private stopLivenessCheck(socket: UpstreamSocket): void {
+    if (socket.livenessTimer) {
+      clearInterval(socket.livenessTimer)
+      socket.livenessTimer = null
     }
   }
 
-  private ingest(stream: ProjectStream, chunk: string): void {
-    stream.buffer += chunk
+  private ingest(stream: ProjectStream, socket: UpstreamSocket, chunk: string): void {
+    socket.buffer += chunk
 
     // Frames are separated by a blank line. A partial frame stays buffered
     // because a chunk boundary can land anywhere in the stream.
-    let idx = stream.buffer.indexOf("\n\n")
+    let idx = socket.buffer.indexOf("\n\n")
     while (idx >= 0) {
-      const frame = stream.buffer.slice(0, idx)
-      stream.buffer = stream.buffer.slice(idx + 2)
+      const frame = socket.buffer.slice(0, idx)
+      socket.buffer = socket.buffer.slice(idx + 2)
       const event = parseFrame(frame)
       if (event) this.broadcast(stream, event)
-      idx = stream.buffer.indexOf("\n\n")
+      idx = socket.buffer.indexOf("\n\n")
     }
 
     // Guard against a broken upstream that never sends a separator.
-    if (stream.buffer.length > 1_000_000) stream.buffer = ""
+    if (socket.buffer.length > 1_000_000) socket.buffer = ""
   }
 
   private broadcast(stream: ProjectStream, event: StreamEvent): void {
@@ -435,27 +664,34 @@ export class EventHub implements OnModuleDestroy {
     return true
   }
 
-  private scheduleRetry(stream: ProjectStream, reason: string): void {
+  private scheduleRetry(stream: ProjectStream, socket: UpstreamSocket, reason: string): void {
     if (stream.stopped) return
-    stream.connecting = false
+    socket.connecting = false
     // Stopped before the socket is torn down, or the interval would fire against
-    // the fresh stream the retry is about to open.
-    this.stopLivenessCheck(stream)
-    this.closeUpstream(stream)
-    if (stream.retryTimer !== null) return
+    // the fresh socket the retry is about to open.
+    this.stopLivenessCheck(socket)
+    this.closeUpstream(socket)
+    if (socket.retryTimer !== null) return
 
-    stream.failures += 1
+    socket.failures += 1
 
     // Tell the waiters a cold start failed so the caller can answer 503 rather
-    // than an empty 200.
-    if (stream.failures === 1) {
+    // than an empty 200 — but only while nothing whatsoever has opened: some
+    // directories sit legitimately unreachable for stretches.
+    if (!this.anySocketOpen(stream) && socket.failures === 1) {
       const waiting = stream.waiters
       stream.waiters = []
       for (const waiter of waiting) waiter(false)
     }
 
-    if (stream.failures >= this.maxSilentFailures) {
-      this.logger.warn(`giving up on "${stream.project.id}" after ${stream.failures} attempts (${reason})`)
+    // All sockets exhausted together is an outage, not one slow directory.
+    // Browser subscribers are flushed so their EventSource reconnects and the
+    // page refetches; internal subscribers (the notifier) simply pause. The
+    // transition is edge-triggered: an open socket resets the marker, so a long
+    // outage flushes once, not once per retry per socket.
+    if (this.allSocketsExhausted(stream, socket.failures) && !stream.flushedSinceLastOpen) {
+      this.logger.warn(`giving up on "${stream.project.id}" after ${socket.failures} attempts (${reason})`)
+      stream.flushedSinceLastOpen = true
       for (const subscriber of [...stream.subscribers]) {
         try {
           subscriber.flush?.()
@@ -465,56 +701,47 @@ export class EventHub implements OnModuleDestroy {
       }
     }
 
-    const delay = stream.retryMs
+    const delay = socket.retryMs
     this.logger.debug(`reconnecting to "${stream.project.id}" in ${delay}ms (${reason})`)
-    stream.retryTimer = setTimeout(() => {
-      stream.retryTimer = null
-      stream.retryMs = Math.min(stream.retryMs * 2, this.retryMaxMs)
-      this.connect(stream)
+    socket.retryTimer = setTimeout(() => {
+      socket.retryTimer = null
+      socket.retryMs = Math.min(socket.retryMs * 2, this.retryMaxMs)
+      this.connect(stream, socket)
     }, delay)
-    stream.retryTimer.unref?.()
+    socket.retryTimer.unref?.()
   }
 
-  private clearRetry(stream: ProjectStream): void {
-    if (stream.retryTimer !== null) {
-      clearTimeout(stream.retryTimer)
-      stream.retryTimer = null
+  private anySocketOpen(stream: ProjectStream): boolean {
+    for (const socket of stream.sockets.values()) {
+      if (socket.res !== null) return true
+    }
+    return false
+  }
+
+  /** True when every currently known socket has exhausted its retry budget. */
+  private allSocketsExhausted(stream: ProjectStream, failures: number): boolean {
+    if (stream.sockets.size === 0) return true
+    for (const socket of stream.sockets.values()) {
+      if (socket.failures < this.maxSilentFailures) return false
+    }
+    return failures >= this.maxSilentFailures
+  }
+
+  private clearRetry(socket: UpstreamSocket): void {
+    if (socket.retryTimer !== null) {
+      clearTimeout(socket.retryTimer)
+      socket.retryTimer = null
     }
   }
 
-  private closeUpstream(stream: ProjectStream): void {
-    this.stopLivenessCheck(stream)
-    stream.res?.destroy()
-    stream.res = null
-    stream.req?.destroy()
-    stream.req = null
-    stream.buffer = ""
-    stream.lastFrameAt = 0
+  private closeUpstream(socket: UpstreamSocket): void {
+    socket.res?.destroy()
+    socket.res = null
+    socket.req?.destroy()
+    socket.req = null
+    socket.buffer = ""
+    socket.lastFrameAt = 0
   }
-}
-
-interface ProjectStream {
-  project: ProjectEntry
-  subscribers: Set<HubSubscriber>
-  waiters: Array<(ok: boolean) => void>
-  req: ClientRequest | null
-  res: IncomingMessage | null
-  /** True from dialling until the attempt resolves, so ticks cannot double-dial. */
-  connecting: boolean
-  buffer: string
-  retryMs: number
-  failures: number
-  retryTimer: ReturnType<typeof setTimeout> | null
-  graceTimer: ReturnType<typeof setTimeout> | null
-  /** Fires while an upstream socket is open, to catch a silent-but-open one. */
-  livenessTimer: ReturnType<typeof setInterval> | null
-  /**
-   * When bytes last arrived on the upstream socket, 0 when there is no socket.
-   *
-   * The staleness signal for a connection Node still believes in.
-   */
-  lastFrameAt: number
-  stopped: boolean
 }
 
 /**

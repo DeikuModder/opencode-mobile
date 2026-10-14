@@ -1,7 +1,7 @@
 import { All, Controller, Get, Inject, Logger, Post, Req, Res, UnauthorizedException, UseGuards } from "@nestjs/common"
 import type { Request, Response } from "express"
 import { SessionGuard } from "../auth/session.guard.js"
-import { ServeProxy } from "./serve-proxy.js"
+import { ServeProxy, UpstreamUnavailableError } from "./serve-proxy.js"
 import { ProjectRegistry } from "../projects/registry.js"
 import { DB } from "../tokens.js"
 import { openDb } from "../auth/db.js"
@@ -55,6 +55,18 @@ export class GatewayController {
     }
     this.registry.touch(active.id)
 
+    // The complete session list is assembled here rather than proxied: the bare
+    // upstream list omits every git-worktree session while still answering 200
+    // (verified live, see ServeProxy.listAllSessions). Sub-paths, mutations, and
+    // any request the browser scoped itself keep the verbatim proxy.
+    const wantsCompleteList = req.method === "GET" && upstreamPath === "/session" && !query
+    if (wantsCompleteList) {
+      const sessions = await this.proxy.listAllSessions(active)
+      res.setHeader("content-type", "application/json")
+      res.end(JSON.stringify(sessions))
+      return
+    }
+
     await this.proxy.forward(req, res, active, upstreamPath || "/", query)
   }
 
@@ -88,5 +100,40 @@ export class GatewayController {
     const project = this.registry.setActive(id)
     const started = await this.registry.ensureStarted(id)
     return { ok: true, active: project.id, serve: started }
+  }
+
+  /**
+   * The full model catalog, grouped by provider.
+   *
+   * Served by the gateway rather than proxied because the upstream `/provider`
+   * answer is megabytes; this returns the reduced, provider-grouped shape the
+   * picker needs (see ServeProxy.modelCatalog).
+   */
+  @Get("gateway/model-catalog")
+  @UseGuards(SessionGuard)
+  async modelCatalog(@Res() res: Response): Promise<void> {
+    const active = this.registry.active()
+    if (!active) {
+      throw new UnauthorizedException({
+        code: "no_projects",
+        message: "No projects configured. Run `pnpm project:add -- <path>` on the host.",
+      })
+    }
+    const started = await this.registry.ensureStarted(active.id)
+    if (!started.ok) {
+      this.logger.warn(`Could not start serve for "${active.id}": ${started.detail ?? "unknown reason"}`)
+    }
+    try {
+      const catalog = await this.proxy.modelCatalog(active)
+      res.setHeader("content-type", "application/json")
+      res.end(JSON.stringify(catalog))
+    } catch (err) {
+      if (err instanceof UpstreamUnavailableError) {
+        res.writeHead(503, { "content-type": "application/json" })
+        res.end(JSON.stringify({ code: "serve_unavailable", message: err.message }))
+        return
+      }
+      throw err
+    }
   }
 }

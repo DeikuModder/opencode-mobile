@@ -195,27 +195,23 @@ describe("session control endpoints", () => {
     }
   })
 
-  it("unwraps the { location, data } envelope of GET /model", async () => {
+  it("returns the grouped catalog from the gateway endpoint", async () => {
     const m = mockFetch(() =>
       Response.json({
-        location: { directory: "C:\\repo", worktree: "C:\\repo" },
-        data: [{ id: "claude-sonnet-4", providerID: "anthropic", name: "Claude Sonnet 4" }],
+        providers: [
+          {
+            id: "opencode",
+            name: "Personal / OpenCode",
+            models: [{ id: "claude-sonnet-4", providerID: "opencode", name: "Claude Sonnet 4" }],
+          },
+        ],
       }),
     )
     try {
-      const models = await serveApi.models()
-      expect(models).toHaveLength(1)
-      expect(models[0]?.id).toBe("claude-sonnet-4")
-    } finally {
-      m.restore()
-    }
-  })
-
-  it("returns an empty model list instead of throwing when data is null", async () => {
-    // `data` is nullable in the spec, which happens when no provider is configured.
-    const m = mockFetch(() => Response.json({ location: {}, data: null }))
-    try {
-      await expect(serveApi.models()).resolves.toEqual([])
+      const catalog = await serveApi.catalog()
+      expect(catalog.providers).toHaveLength(1)
+      expect(catalog.providers[0]?.name).toBe("Personal / OpenCode")
+      expect(catalog.providers[0]?.models[0]?.id).toBe("claude-sonnet-4")
     } finally {
       m.restore()
     }
@@ -234,8 +230,8 @@ describe("session control endpoints", () => {
         }),
     )
     try {
-      await expect(serveApi.models()).rejects.toThrow(/Expected JSON but got the SPA page/)
-      await expect(serveApi.models()).rejects.toThrow(/api\/model/)
+      await expect(serveApi.catalog()).rejects.toThrow(/Expected JSON but got the SPA page/)
+      await expect(serveApi.catalog()).rejects.toThrow(/model-catalog/)
     } finally {
       m.restore()
     }
@@ -250,7 +246,7 @@ describe("session control endpoints", () => {
         }),
     )
     try {
-      await expect(serveApi.models()).rejects.toThrow(/Malformed JSON/)
+      await expect(serveApi.catalog()).rejects.toThrow(/Malformed JSON/)
     } finally {
       m.restore()
     }

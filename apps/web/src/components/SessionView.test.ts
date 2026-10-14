@@ -188,12 +188,17 @@ function withQuestion(pending: unknown[]) {
     if (url.includes("/api/projects")) {
       return json({ active: "proj_1", projects: [{ id: "proj_1", name: "one" }] })
     }
-    if (url.includes("/api/model")) {
+    if (url.includes("/api/gateway/model-catalog")) {
       return json({
-        location: { directory: "C:\\repo", worktree: "C:\\repo" },
-        data: [
-          { id: "model-b", providerID: "prov", name: "Model B" },
-          { id: "model-a", providerID: "prov", name: "Model A", enabled: false },
+        providers: [
+          {
+            id: "prov",
+            name: "Big Provider",
+            models: [
+              { id: "model-b", providerID: "prov", name: "Model B" },
+              { id: "model-a", providerID: "prov", name: "Model A", enabled: false },
+            ],
+          },
         ],
       })
     }
@@ -217,9 +222,10 @@ beforeEach(() => {
       new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } })
     if (url.includes("/message?")) return json([])
     if (url.includes("/message")) return json({})
-    // The setters reply 204 and are matched on their full path so the model LIST
-    // route (/api/model) is not caught by the `/model` suffix. Both live in the
-    // `/api/session/...` family upstream; the unprefixed paths are the SPA page.
+    // The setters reply 204 and are matched on their full path so the model
+    // catalog route (/api/gateway/model-catalog) is not caught by the `/model`
+    // suffix. Both live in the `/api/session/...` family upstream; the
+    // unprefixed paths are the SPA page.
     if (url.includes("/todo")) return json([])
     if (url.includes("/question") || url.includes("/permission")) return json([])
     if (/\/question\/[^/]+\/(reply|reject)$/.test(url)) return new Response(null, { status: 204 })
@@ -229,17 +235,22 @@ beforeEach(() => {
     if (url.includes("/api/projects")) {
       return json({ active: "proj_1", projects: [{ id: "proj_1", name: "one" }] })
     }
-    if (url.includes("/path")) {
-      return json({ home: "C:\\Users", state: "s", config: "c", worktree: "C:\\repo", directory: "C:\\repo" })
-    }
-    if (url.includes("/api/model")) {
+    if (url.includes("/api/gateway/model-catalog")) {
       return json({
-        location: { directory: "C:\\repo", worktree: "C:\\repo" },
-        data: [
-          { id: "model-b", providerID: "prov", name: "Model B" },
-          { id: "model-a", providerID: "prov", name: "Model A", enabled: false },
+        providers: [
+          {
+            id: "prov",
+            name: "Big Provider",
+            models: [
+              { id: "model-b", providerID: "prov", name: "Model B" },
+              { id: "model-a", providerID: "prov", name: "Model A", enabled: false },
+            ],
+          },
         ],
       })
+    }
+    if (url.includes("/path")) {
+      return json({ home: "C:\\Users", state: "s", config: "c", worktree: "C:\\repo", directory: "C:\\repo" })
     }
     return json([])
   }))
@@ -490,6 +501,13 @@ expect(screen.getByText(/Understood/)).toBeTruthy()
     const labels = [...select.options].map((o) => o.textContent)
     expect(labels).toContain("Model B")
     expect(labels).not.toContain("Model A")
+    // Options are grouped under the provider's display name, not its raw id.
+    // One option remains besides the placeholder: Model B, under its group.
+    const group = select.querySelector("optgroup")
+    expect(group).toBeTruthy()
+    expect((group as HTMLOptGroupElement).label).toBe("Big Provider")
+    expect(group?.querySelectorAll("option")).toHaveLength(1)
+    expect(group?.querySelector("option")?.textContent).toBe("Model B")
   })
 
   it("switches mode through the agent endpoint and keeps Build pressed by default", async () => {
@@ -549,7 +567,7 @@ expect(screen.getByText(/Understood/)).toBeTruthy()
       if (url.includes("/session/")) return json({ id: SESSION, title: "t" })
       if (url.includes("/api/projects")) return json({ active: "p1", projects: [{ id: "p1", name: "one" }] })
       if (url.includes("/path")) return json({ home: "h", state: "s", config: "c", worktree: "w", directory: "w" })
-      if (url.includes("/api/model")) return json({ location: {}, data: [] })
+      if (url.includes("/api/gateway/model-catalog")) return json({ providers: [] })
       return json([])
     })
 
@@ -577,7 +595,7 @@ expect(screen.getByText(/Understood/)).toBeTruthy()
         })
       }
       if (url.includes("/message")) return json([])
-      if (url.includes("/api/model")) return json({ location: {}, data: [] })
+      if (url.includes("/api/gateway/model-catalog")) return json({ providers: [] })
       if (url.includes("/api/projects")) return json({ active: "p1", projects: [{ id: "p1", name: "one" }] })
       if (url.includes("/path")) return json({ home: "h", state: "s", config: "c", worktree: "w", directory: "w" })
       if (url.includes("/todo")) return json([])
@@ -938,10 +956,11 @@ function withSession(state: { messages: unknown[]; revert?: { messageID: string 
         return json({ id: SESSION, title: "t", revert: state.revert ?? null })
       } else if (url.includes("/api/projects")) {
         return json({ active: "proj_1", projects: [{ id: "proj_1", name: "one" }] })
-      } else if (url.includes("/api/model")) {
+      } else if (url.includes("/api/gateway/model-catalog")) {
         return json({
-          location: { directory: "C:\\repo", worktree: "C:\\repo" },
-          data: [{ id: "model-b", providerID: "prov", name: "Model B", enabled: true }],
+          providers: [
+            { id: "prov", name: "Big Provider", models: [{ id: "model-b", providerID: "prov", name: "Model B", enabled: true }] },
+          ],
         })
       } else if (url.includes("/path")) {
         return json({ home: "C:\\Users", state: "s", config: "c", worktree: "C:\\repo", directory: "C:\\repo" })

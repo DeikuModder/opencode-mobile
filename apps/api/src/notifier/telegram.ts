@@ -333,8 +333,7 @@ export class TelegramNotifier implements OnModuleInit, OnModuleDestroy {
     const started = await this.registry.ensureStarted(active.id)
     if (!started.ok) throw new Error(`serve unavailable: ${started.detail ?? "unknown reason"}`)
 
-    const host = process.env.SERVE_HOST ?? "host.docker.internal"
-    const url = `http://${host}:${active.port}/session/${encodeURIComponent(sessionId)}/permissions/${encodeURIComponent(permissionId)}`
+    const url = `http://${this.config.serve.host}:${active.port}/session/${encodeURIComponent(sessionId)}/permissions/${encodeURIComponent(permissionId)}`
 
     const headers: Record<string, string> = { "content-type": "application/json" }
     if (this.config.serve.password) {

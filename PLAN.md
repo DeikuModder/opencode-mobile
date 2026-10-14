@@ -16,7 +16,7 @@ Core application is complete and verified:
 - Telegram notifier with allowlisted user, permission buttons, live status.
 - Native logon-task deployment and Docker gateway image.
 
-Last full verification: 186 API tests and 75 web tests passing, both packages
+Last full verification: 188 API tests and 75 web tests passing, both packages
 typecheck, web production build succeeds, Docker image builds and serves the SPA
 and API. Verified against the shipped container build, not just the host tree.
 
@@ -150,6 +150,23 @@ rather than assumed.
 
 The notifier still has its own independent lifecycle; it simply shares the
 upstream connection instead of opening a private one.
+
+**Directory-scoped upstream dial (drift since ~1.18.33).** opencode filters
+`/event` subscribers by the `directory` query, which the shipped 1.18.32 spec
+does not document. A bare dial answers 200 and then delivers nothing but
+heartbeats — verified live against 1.18.35: bare stream 4 frames, directory-
+scoped stream 501, for the same turn. Both user-reported symptoms traced to
+this one starvation: no realtime streaming (refresh masked it by refetching the
+transcript over REST) and question cards that never rendered (the question flow
+is event-driven, so it starved first). The hub dial carries the project path
+(`event-hub.ts`), and `test/event-hub.spec.ts` pins the dialled URL so an
+opencode upgrade cannot silently starve the stream again.
+
+The same filter cut the other way, and it is load-bearing: the session list is
+directory-filtered too, so the proxy must NOT stamp the project path onto
+forwarded queries — verified live, 27 sessions on a bare request versus 3 with
+the project directory, all answering 200. Only the hub's `/event` dial (and any
+request the browser scopes itself) carries a `directory`.
 
 ### 3. SQLite on a Windows bind mount went stale — FIXED, root cause measured
 

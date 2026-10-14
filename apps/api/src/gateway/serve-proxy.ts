@@ -9,6 +9,24 @@ import { EventHub, type StreamEvent } from "./event-hub.js"
 /** How often to emit an SSE comment when the upstream has been quiet. */
 const PING_INTERVAL_MS = 15_000
 
+/** How long a reduced provider catalog stays valid before `/provider` is re-read. */
+const CATALOG_TTL_MS = 10 * 60_000
+
+/** Raw shape of one model inside a `/provider` entry. */
+type ProviderModelRaw = {
+  id?: string
+  providerID?: string
+  name?: string
+  status?: string
+  enabled?: boolean
+}
+
+/** Newest-first sort key for a session record. */
+function updatedOf(s: Record<string, unknown>): number {
+  const t = s.time as { updated?: number; created?: number } | undefined
+  return t?.updated ?? t?.created ?? 0
+}
+
 export class UpstreamUnavailableError extends Error {
   constructor(
     message: string,
@@ -32,6 +50,9 @@ export class UpstreamUnavailableError extends Error {
 @Injectable()
 export class ServeProxy {
   private readonly logger = new Logger(ServeProxy.name)
+
+  /** Reduced provider catalog, cached per project so /provider is parsed once per window. */
+  private readonly catalogCache = new Map<string, { at: number; promise: Promise<unknown> }>()
 
   constructor(
     @Inject(APP_CONFIG) private readonly config: AppConfig,
@@ -84,6 +105,11 @@ export class ServeProxy {
       return
     }
 
+    // The browser's query is forwarded verbatim. Notably the session list is
+    // directory-filtered by opencode, so stamping the project path here would
+    // hide every session created outside it (verified live: 27 sessions bare,
+    // 3 with the project directory). Only /event is scoped, and the hub's
+    // dial already carries the project path for that stream.
     const target = `${base}${upstreamPath}${query ? `?${query}` : ""}`
     const headers = this.upstreamHeaders(incoming)
 
@@ -142,6 +168,132 @@ export class ServeProxy {
     // If the client disconnects, tear down the upstream request too, otherwise
     // a closed browser tab leaks a connection for the life of the request.
     res.on("close", () => upstream.destroy())
+  }
+
+  /**
+   * The complete session list of this instance.
+   *
+   * The bare `GET /session` answers with every *global* session but omits ones
+   * belonging to a git worktree — verified live against 1.18.35: 27 sessions
+   * bare while `/session?directory=<worktree>` answered exactly that worktree's,
+   * and `/project` names every known worktree. The complete picture is the bare
+   * list plus one scoped call per worktree, deduplicated by id. It is loopback
+   * traffic, so the phone still pays for exactly one request. A failing
+   * `/project` scan degrades to the bare list rather than failing the request.
+   */
+  async listAllSessions(project: ProjectEntry): Promise<unknown> {
+    const base = this.baseUrlFor(project)
+    const headers: Record<string, string> = {}
+    if (this.config.serve.password) {
+      headers["authorization"] = `Basic ${Buffer.from(`opencode:${this.config.serve.password}`).toString("base64")}`
+    }
+    const getJson = async (path: string): Promise<unknown> => {
+      const res = await fetch(`${base}${path}`, { headers, signal: AbortSignal.timeout(15_000) })
+      if (!res.ok) throw new Error(`upstream ${path} answered ${res.status}`)
+      return res.json()
+    }
+
+    const byId = new Map<string, Record<string, unknown>>()
+    const global = await getJson("/session")
+    for (const s of Array.isArray(global) ? (global as Array<Record<string, unknown>>) : []) {
+      const id = String(s.id ?? "")
+      if (id) byId.set(id, s)
+    }
+
+    try {
+      const projects = (await getJson("/project")) as Array<{ worktree?: unknown }>
+      const worktrees = new Set<string>()
+      for (const p of Array.isArray(projects) ? projects : []) {
+        const w = p?.worktree
+        // "/" is the global project, already covered by the bare list; the same
+        // path can be registered under several ids, so the set deduplicates.
+        if (typeof w === "string" && w !== "/" && w.length > 0) worktrees.add(w)
+      }
+      await Promise.all(
+        [...worktrees].map(async (worktree) => {
+          try {
+            const scoped = (await getJson(`/session?directory=${encodeURIComponent(worktree)}`)) as unknown
+            for (const s of Array.isArray(scoped) ? (scoped as Array<Record<string, unknown>>) : []) {
+              const id = String(s.id ?? "")
+              if (id && !byId.has(id)) byId.set(id, s)
+            }
+          } catch (err) {
+            this.logger.warn(`scoped session list failed for "${worktree}": ${(err as Error).message}`)
+          }
+        }),
+      )
+    } catch (err) {
+      this.logger.warn(`/project scan failed, serving the bare session list: ${(err as Error).message}`)
+    }
+
+    return [...byId.values()].sort((a, b) => updatedOf(b) - updatedOf(a))
+  }
+
+  /** Reduces the upstream `/provider` answer to id/name/status fields. */
+  private buildCatalog(all: Array<{ id?: string; name?: string; models?: Record<string, ProviderModelRaw> }>): unknown {
+    const providers = all
+      .filter((p) => p.id && p.models && Object.keys(p.models).length > 0)
+      .map((p) => ({
+        id: String(p.id),
+        name: p.name || String(p.id),
+        models: Object.values(p.models as Record<string, ProviderModelRaw>)
+          .map((m) => ({
+            id: String(m.id ?? ""),
+            providerID: String(m.providerID ?? p.id ?? ""),
+            name: m.name || m.id || "",
+            ...(m.status ? { status: m.status } : {}),
+            ...(m.enabled === undefined ? {} : { enabled: m.enabled }),
+          }))
+          .filter((m) => m.id && m.name),
+      }))
+      .filter((p) => p.models.length > 0)
+    // The two opencode-owned providers first, in usage order; everything else
+    // follows alphabetically so the groups stay findable in a long list.
+    const rank = (id: string): number => (id === "opencode" ? 0 : id === "opencode-go" ? 1 : 2)
+    providers.sort((a, b) => rank(a.id) - rank(b.id) || a.name.localeCompare(b.name))
+    for (const p of providers) p.models.sort((a, b) => a.name.localeCompare(b.name))
+    return { providers }
+  }
+
+  /**
+   * Every configured model, grouped by its provider.
+   *
+   * `/api/model` answers only with the personal catalog — 39 entries, every one
+   * providerID "opencode" — while `/provider` names all of them ("Personal /
+   * OpenCode", "OpenCode Go", Anthropic, ...) and carries thousands of models
+   * scaled to megabytes. The reduction runs here behind a TTL cache so the
+   * phone pays kilobytes, once per window.
+   */
+  modelCatalog(project: ProjectEntry): Promise<unknown> {
+    const cached = this.catalogCache.get(project.id)
+    if (cached && Date.now() - cached.at < CATALOG_TTL_MS) return cached.promise
+
+    const base = this.baseUrlFor(project)
+    const headers: Record<string, string> = {}
+    if (this.config.serve.password) {
+      headers["authorization"] = `Basic ${Buffer.from(`opencode:${this.config.serve.password}`).toString("base64")}`
+    }
+    const promise = (async () => {
+      const res = await fetch(`${base}/provider`, { headers, signal: AbortSignal.timeout(30_000) })
+      if (!res.ok) throw new UpstreamUnavailableError(`provider catalog answered ${res.status}`)
+      const body = (await res.json()) as {
+        all?: Array<{ id?: string; name?: string; models?: Record<string, ProviderModelRaw> }>
+      }
+      return this.buildCatalog(body.all ?? [])
+    })().then(
+      (data) => {
+        this.catalogCache.set(project.id, { at: Date.now(), promise: Promise.resolve(data) })
+        return data
+      },
+      (err: Error) => {
+        this.catalogCache.delete(project.id)
+        throw err
+      },
+    )
+    // The in-flight promise is cached too, so simultaneous pickers share one
+    // upstream fetch instead of racing megabyte payloads against each other.
+    this.catalogCache.set(project.id, { at: Date.now(), promise })
+    return promise
   }
 
   /**

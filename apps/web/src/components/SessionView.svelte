@@ -50,6 +50,7 @@ type ProjectInfo,
 
   /* ------------------------------------------------ model, mode and directory */
   let models = $state<ModelInfo[]>([])
+  let providerNames = $state(new Map<string, string>())
   let modelKey = $state("")
   let agent = $state("build")
   let cwd = $state<ServePath | null>(null)
@@ -544,7 +545,7 @@ type ProjectInfo,
     try {
       const [modelResult, pathResult, projectResult, todoResult, sessionResult] =
         await Promise.allSettled([
-          serveApi.models(),
+          serveApi.catalog(),
           serveApi.path(),
           serveApi.projects(),
           serveApi.todos(sessionId),
@@ -552,7 +553,8 @@ type ProjectInfo,
         ])
 
     if (modelResult.status === "fulfilled") {
-      models = modelResult.value.filter((m) => m.enabled !== false)
+      providerNames = new Map(modelResult.value.providers.map((p) => [p.id, p.name]))
+      models = modelResult.value.providers.flatMap((p) => p.models).filter((m) => m.enabled !== false)
     }
 
     // The session record is the authority on the current mode and model.
@@ -599,6 +601,29 @@ type ProjectInfo,
   function modelLabel(m: ModelInfo): string {
     return m.name || m.id
   }
+
+  /**
+   * The picker's option groups, one per provider.
+   *
+   * A model is only uniquely identified by provider AND id — several providers
+   * carry models with the same id — so the key stays "provider/id" and the
+   * groups let the user see which catalogue each entry comes from ("Personal /
+   * OpenCode", "OpenCode Go", ...). Providers the instance has no models for
+   * are simply absent.
+   */
+  const modelGroups = $derived.by(() => {
+    const groups = new Map<string, ModelInfo[]>()
+    for (const m of models) {
+      const list = groups.get(m.providerID)
+      if (list) list.push(m)
+      else groups.set(m.providerID, [m])
+    }
+    return [...groups.entries()].map(([id, list]) => ({
+      id,
+      label: providerNames.get(id) ?? id,
+      models: [...list].sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id)),
+    }))
+  })
 
   async function chooseModel(key: string) {
     const m = models.find((x) => keyOf(x) === key)
@@ -1169,8 +1194,12 @@ type ProjectInfo,
         {#if controlsLoading && !models.length}
           <option value="">loading…</option>
         {/if}
-        {#each models as m (keyOf(m))}
-          <option value={keyOf(m)}>{modelLabel(m)}</option>
+        {#each modelGroups as g (g.id)}
+          <optgroup label={g.label}>
+            {#each g.models as m (keyOf(m))}
+              <option value={keyOf(m)}>{modelLabel(m)}</option>
+            {/each}
+          </optgroup>
         {/each}
       </select>
     </label>

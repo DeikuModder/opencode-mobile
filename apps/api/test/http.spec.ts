@@ -591,6 +591,57 @@ describe("serve proxy request forwarding", () => {
           res.end(JSON.stringify(ok ? { ok: true } : { message: "Expected object, got undefined" }))
           return
         }
+        // Fixtures for the aggregated session list and the model catalog. The
+        // shapes mirror what 1.18.35 answers live: the bare session list holds
+        // only global sessions, worktree sessions come per directory, and the
+        // provider list carries one provider with no models to prove it drops.
+        if (req.method === "GET" && req.url === "/session") {
+          res.writeHead(200, { "content-type": "application/json" })
+          res.end(JSON.stringify([{ id: "ses-global", time: { created: 10, updated: 10 } }]))
+          return
+        }
+        if (req.method === "GET" && req.url === "/project") {
+          res.writeHead(200, { "content-type": "application/json" })
+          res.end(
+            JSON.stringify([
+              { id: "global", worktree: "/" },
+              { id: "pa", worktree: "C:\\proj-a" },
+              { id: "pa-dup", worktree: "C:\\proj-a" },
+              { id: "pb", worktree: "C:\\proj-b" },
+            ]),
+          )
+          return
+        }
+        if (req.method === "GET" && req.url?.startsWith("/session?directory=")) {
+          const dir = decodeURIComponent(req.url.slice("/session?directory=".length).split("&")[0] ?? "")
+          res.writeHead(200, { "content-type": "application/json" })
+          res.end(JSON.stringify(dir === "C:\\proj-a" ? [{ id: "ses-proj-a", time: { created: 20, updated: 99 } }] : []))
+          return
+        }
+        if (req.method === "GET" && req.url === "/provider") {
+          res.writeHead(200, { "content-type": "application/json" })
+          res.end(
+            JSON.stringify({
+              all: [
+                {
+                  id: "opencode-go",
+                  name: "OpenCode Go",
+                  models: { "go-1": { id: "go-1", providerID: "opencode-go", name: "Go One" } },
+                },
+                {
+                  id: "opencode",
+                  name: "Personal / OpenCode",
+                  models: {
+                    "zen-1": { id: "zen-1", providerID: "opencode", name: "Zen One" },
+                    "zen-2": { id: "zen-2", providerID: "opencode", name: "Zen Two", enabled: false },
+                  },
+                },
+                { id: "empty-prov", name: "Empty", models: {} },
+              ],
+            }),
+          )
+          return
+        }
         res.writeHead(200, { "content-type": "application/json" })
         res.end(JSON.stringify({ ok: true, echo: body }))
       })
@@ -661,6 +712,57 @@ describe("serve proxy request forwarding", () => {
 
     expect(received[0].method).toBe("GET")
     expect(received[0].url).toContain("directory=C%3A%5Ctmp")
+  })
+
+  it("does not stamp the project directory into forwarded queries", async () => {
+    // opencode filters /session by the `directory` query, so a stamped path
+    // would hide every session created outside the project directory while
+    // still answering 200 — verified live (27 sessions bare, 3 with the
+    // project directory). The list must reach the upstream exactly as the
+    // browser sent it; only the hub's /event dial carries the project path.
+    await seedUser()
+    const cookie = await login()
+    await request(app.getHttpServer())
+      .get("/api/serve/question")
+      .set("Cookie", cookie)
+      .set("Origin", ORIGIN)
+      .expect(200)
+
+    expect(received[0].url).toBe("/question")
+  })
+
+  it("merges worktree sessions into the bare list, newest first", async () => {
+    // The bare upstream list omits git-worktree sessions entirely (verified
+    // live against 1.18.35), so the gateway scans /project and folds the scoped
+    // lists in. Order matters: the newest session comes first.
+    await seedUser()
+    const cookie = await login()
+    const res = await request(app.getHttpServer())
+      .get("/api/serve/session")
+      .set("Cookie", cookie)
+      .set("Origin", ORIGIN)
+      .expect(200)
+
+    expect(Array.isArray(res.body)).toBe(true)
+    expect(res.body.map((s: { id: unknown }) => s.id)).toEqual(["ses-proj-a", "ses-global"])
+  })
+
+  it("serves the model catalog grouped by provider, opencode-owned first", async () => {
+    // Groups come from /provider display names; providers without models drop;
+    // disabled models stay in the payload and are filtered on the client, as
+    // the flat list did before.
+    await seedUser()
+    const cookie = await login()
+    const res = await request(app.getHttpServer())
+      .get("/api/gateway/model-catalog")
+      .set("Cookie", cookie)
+      .set("Origin", ORIGIN)
+      .expect(200)
+
+    expect(res.body.providers.map((p: { id: string }) => p.id)).toEqual(["opencode", "opencode-go"])
+    const zen = res.body.providers.find((p: { id: string }) => p.id === "opencode")
+    expect(zen.name).toBe("Personal / OpenCode")
+    expect(zen.models.map((m: { id: string }) => m.id)).toEqual(["zen-1", "zen-2"])
   })
 
   it("replaces the client's credentials with the serve password", async () => {

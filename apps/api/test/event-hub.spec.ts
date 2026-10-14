@@ -38,7 +38,15 @@ interface FakeUpstream {
   live: number
   status: number
   lastHeaders: IncomingHttpHeaders | null
-  send(payload: unknown): void
+  lastUrl: string | null
+  /** Every /event request URL, in dial order — the hub's dial set. */
+  eventUrls: string[]
+  /** What GET /session (bare) and the per-worktree scoped lists answer. */
+  scans: {
+    bare: Array<{ id: string; directory?: string }>
+    worktrees: Record<string, Array<{ id: string; directory?: string }>>
+  }
+  send(payload: unknown, scope?: string): void
   endAll(): void
   destroyAll(): void
   /**
@@ -54,18 +62,48 @@ interface FakeUpstream {
 
 function makeUpstream(): Promise<FakeUpstream> {
   const sockets = new Set<ServerResponse>()
+  const socketUrls = new Map<ServerResponse, string>()
   const state = {
     connections: 0,
     peakConcurrent: 0,
     live: 0,
     status: 200,
     lastHeaders: null as IncomingHttpHeaders | null,
+    lastUrl: null as string | null,
     silent: false,
+  }
+  const eventUrls: string[] = []
+  const scans = {
+    bare: [] as Array<{ id: string; directory?: string }>,
+    worktrees: {} as Record<string, Array<{ id: string; directory?: string }>>,
   }
 
   const server = createServer((req, res) => {
-    state.connections += 1
     state.lastHeaders = req.headers
+    state.lastUrl = req.url ?? null
+
+    // The hub's directory scan speaks REST, not SSE. Answering those with the
+    // event-stream shape would hang the scan (and throw off every test's
+    // connection count), so they always answer JSON here.
+    if (!req.url?.startsWith("/event")) {
+      let payload: unknown = { ok: true }
+      if (req.url === "/session") payload = scans.bare
+      else if (req.url === "/project") {
+        payload = [
+          { id: "global", worktree: "/" },
+          ...Object.keys(scans.worktrees).map((w) => ({ id: w, worktree: w })),
+        ]
+      } else if (req.url?.startsWith("/session?directory=")) {
+        const dir = decodeURIComponent(req.url.slice("/session?directory=".length).split("&")[0] ?? "")
+        payload = scans.worktrees[dir] ?? []
+      }
+      res.writeHead(state.status !== 200 ? state.status : 200, { "content-type": "application/json" })
+      res.end(JSON.stringify(payload))
+      return
+    }
+
+    eventUrls.push(req.url ?? "")
+    state.connections += 1
     if (state.status !== 200) {
       res.writeHead(state.status)
       res.end()
@@ -74,6 +112,7 @@ function makeUpstream(): Promise<FakeUpstream> {
     state.live += 1
     state.peakConcurrent = Math.max(state.peakConcurrent, state.live)
     sockets.add(res)
+    socketUrls.set(res, req.url ?? "")
     res.writeHead(200, { "content-type": "text/event-stream" })
     // Flushed, not merely staged. writeHead only queues the headers, and a real
     // SSE server sends its first frame immediately, so the client's response
@@ -117,8 +156,24 @@ function makeUpstream(): Promise<FakeUpstream> {
         get lastHeaders() {
           return state.lastHeaders
         },
-        send(payload: unknown) {
-          for (const res of sockets) res.write(`data: ${JSON.stringify(payload)}\n\n`)
+        get lastUrl() {
+          return state.lastUrl
+        },
+        get eventUrls() {
+          return eventUrls
+        },
+        set scans(next: typeof scans) {
+          scans.bare = next.bare
+          scans.worktrees = next.worktrees
+        },
+        get scans() {
+          return scans
+        },
+        send(payload: unknown, scope?: string) {
+          for (const res of sockets) {
+            if (scope && !socketUrls.get(res)?.includes(scope)) continue
+            res.write(`data: ${JSON.stringify(payload)}\n\n`)
+          }
         },
         endAll() {
           for (const res of sockets) res.end()
@@ -450,6 +505,58 @@ describe("event hub fan-out", () => {
     const expected = `Basic ${Buffer.from("opencode:serve-pw").toString("base64")}`
     expect(upstream.lastHeaders?.["authorization"]).toBe(expected)
     expect(upstream.lastHeaders?.["cookie"]).toBeUndefined()
+  })
+
+  it("opens one upstream per observed session directory, bare dial covering the project path", async () => {
+    // opencode scopes the /event bus by the session's own directory: a bare
+    // dial's scope is the serve's cwd, a scoped dial gets exactly that
+    // directory's frames, and there is no wildcard (verified live against
+    // 1.18.35). Discovering the set from the real session list is what keeps a
+    // hub from silently starving every directory outside its project path.
+    const upstream = await makeUpstream()
+    cleanups.push(() => new Promise<void>((r) => upstream.server.close(() => r())))
+    upstream.scans = {
+      // The project path goes through the bare dial — a second socket for it
+      // would duplicate every frame delivered to the UI.
+      bare: [{ id: "s0", directory: "C:\\demo" }],
+      worktrees: { "C:\\repos\\other": [{ id: "s1", directory: "C:\\repos\\other" }] },
+    }
+    const { hub } = makeHub()
+
+    hub.subscribe(project(upstream.port), collector().sub)
+    await until(() => upstream.eventUrls.length >= 2, "both dials opened")
+
+    const query = new URLSearchParams({ directory: "C:\\repos\\other" }).toString()
+    expect(upstream.eventUrls).toContain("/event")
+    expect(upstream.eventUrls).toContain(`/event?${query}`)
+    // One socket per directory: the bare dial must not be duplicated by the
+    // project path seen in the scan.
+    expect(upstream.eventUrls.filter((u) => u.includes("directory="))).toHaveLength(1)
+  })
+
+  it("delivers frames from any directory's socket to every subscriber", async () => {
+    const upstream = await makeUpstream()
+    cleanups.push(() => new Promise<void>((r) => upstream.server.close(() => r())))
+    upstream.scans = {
+      bare: [],
+      worktrees: { "C:\\repos\\other": [{ id: "s1", directory: "C:\\repos\\other" }] },
+    }
+    const { hub } = makeHub()
+
+    const tab = collector()
+    hub.subscribe(project(upstream.port), tab.sub)
+    await until(() => upstream.eventUrls.length >= 2, "both dials opened")
+
+    const query = new URLSearchParams({ directory: "C:\\repos\\other" }).toString()
+    // Only the worktree's socket carries this frame; the bare dial never saw it.
+    upstream.send({ type: "message.updated", properties: { id: "from-other" } }, `directory=${query.split("=")[1]}`)
+    await until(() => tab.events.length >= 1, "scoped frame delivered")
+    expect(tab.events[0]).toMatchObject({ type: "message.updated", properties: { id: "from-other" } })
+
+    // The bare dial keeps streaming its own scope to the same subscriber.
+    upstream.send({ type: "file.edited", properties: {} })
+    await until(() => tab.events.length >= 2, "bare frame delivered")
+    expect(tab.events[1]).toMatchObject({ type: "file.edited" })
   })
 
   it("never lets one slow client hold the shared stream hostage", () => {

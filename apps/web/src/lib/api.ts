@@ -372,6 +372,18 @@ export interface ModelInfo {
   status?: string
 }
 
+/** One provider's slice of the catalog, with models reduced to picker fields. */
+export interface ModelCatalogProvider {
+  id: string
+  name: string
+  models: ModelInfo[]
+}
+
+/** Every configured model of this instance, grouped by provider. */
+export interface ModelCatalog {
+  providers: ModelCatalogProvider[]
+}
+
 /** One selectable answer to a question. */
 export interface QuestionOption {
   label: string
@@ -626,22 +638,15 @@ export const serveApi = {
       { method: "POST", body: { response } },
     ),
   /**
-   * Available models, already reduced to picker fields.
+   * The complete model catalog, grouped by provider.
    *
-   * The endpoint answers `{ location, data }` and `data` can be null, so the
-   * unwrapping happens here rather than at each call site.
-   *
-   * The path is `/api/model`, NOT `/model`. Verified live: `/api/model` returns
-   * 4.5 MB of JSON, while `/model` returns opencode's SPA fallback with HTTP 200.
-   * A missing route is not a 404 here, which is what made this expensive to
-   * diagnose.
+   * Served by the gateway, not proxied: `/api/model` answers only with the
+   * personal catalog — 39 entries, every one providerID "opencode" — while the
+   * upstream that names everything ("Personal / OpenCode", "OpenCode Go",
+   * Anthropic, ...) is `/provider`, which runs to megabytes. The gateway
+   * reduces and caches it, so the phone fetches kilobytes.
    */
-  models: async (): Promise<ModelInfo[]> => {
-    const res = await request<{ location?: unknown; data?: ModelInfo[] | null }>(
-      "/api/serve/api/model",
-    )
-    return Array.isArray(res?.data) ? res.data : []
-  },
+  catalog: () => request<ModelCatalog>("/api/gateway/model-catalog"),
   /**
    * The instance's working directory and the worktree it belongs to.
    *
